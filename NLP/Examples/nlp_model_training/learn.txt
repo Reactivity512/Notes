@@ -1,0 +1,12 @@
+python -m spacy train ./config.cfg --output ./model_output --paths.train ./train.json --paths.dev ./dev.json
+
+
+./model_output — папка для сохранения модели
+./train.json и ./dev.json — ваши файлы с обучающими и валидационными данными
+
+===================
+
+
+ru_core_news_sm — небольшая модель, отлично подходит для базовых задач.
+ru_core_news_md — средняя по размеру, более точная.
+ru_core_news_lg — крупная, возможно, самая точная, требует больше ресурсов.
