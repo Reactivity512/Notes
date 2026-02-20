@@ -13,6 +13,37 @@
 
 *Воркер берет задачу, выполняет её и забывает. Он не хранит состояние между задачами.*
 
+```mermaid
+graph TD
+    A[Источник задач / Client] --> B{Канал задач / Tasks Chan};
+    
+    B --> C[Worker 1];
+    B --> D[Worker 2];
+    B --> E[Worker 3]
+    B --> R[Worker N...];
+    
+    C --> F[Общий канал результатов<br>или прямая обработка];
+    D --> F;
+    E --> F;
+    R --> F;
+
+    subgraph "Worker Pool"
+        direction LR
+        C
+        D
+        E
+        R
+    end
+
+    F --> G[Сбор результатов];
+
+    style B fill:#lightblue,stroke:#333
+    style C fill:#lightgreen,stroke:#333
+    style D fill:#lightgreen,stroke:#333
+    style E fill:#lightgreen,stroke:#333
+    style R fill:#lightgreen,stroke:#333
+```
+
 ### Отличие Worker Pool от других подходов:
 
 1. **Горутины `go func()`:**
@@ -42,27 +73,6 @@
 
 * Минусы против Worker Pool: Избыточен для простой конкурентной обработки.
 
-
-Пример **Production-ready**: [Worker Pool](./worker_pool.go)
-
-Ключевые моменты:
-* `Start()` — инициализация и запуск
-* `Stop()` — немедленная остановка (с отменой контекста)
-* `StopAndWait()` — *graceful shutdown* (ждет завершения текущих задач)
-* Каждая задача запускается в отдельной горутине с `recover()`
-* Паника не убивает весь воркер, а превращается в ошибку результата
-* Кастомный `panicHandler` для логирования
-* Контекст пробрасывается в каждый хендлер задачи
-* При остановке пула все задачи получают сигнал отмены
-* Поддержка таймаутов на отправку задачи
-* `Submit()` — блокирующая отправка
-* `SubmitWithTimeout()` — отправка с таймаутом
-* `TrySubmit()` — неблокирующая отправка
-* Каналы закрываются только после остановки всех писателей
-* `sync.WaitGroup` гарантирует завершение всех воркеров
-* Канал `doneCh` для внешнего ожидания полной остановки
-* Атомарные счетчики для статистики
-
 Пример (упрощенный):
 ```go
 package main
@@ -73,106 +83,37 @@ import (
     "time"
 )
 
-// Job представляет задачу для выполнения
-type Job struct {
-    ID      int
-    Data    string
-    Handler func(id int) int
-}
-
-// Result представляет результат выполнения задачи
-type Result struct {
-    JobID  int
-    Output string
-}
-
-// WorkerPool управляет пулом воркеров
-type WorkerPool struct {
-    JobQueue   chan Job
-    Result     chan Result
-    NumWorkers int
-    wg         sync.WaitGroup
-}
-
-// NewWorkerPool создаёт новый пул воркеров
-func NewWorkerPool(numWorkers, queueSize int) *WorkerPool {
-    return &WorkerPool{
-        JobQueue:   make(chan Job, queueSize),
-        Result:     make(chan Result, queueSize),
-        NumWorkers: numWorkers,
-    }
-}
-
-// worker — функция воркера, обрабатывающего задачи из канала
-func (wp *WorkerPool) worker(id int) {
-    defer wp.wg.Done()
-
-    for job := range wp.JobQueue {
-        fmt.Printf("Worker %d обрабатывает задачу %d: %s\n", id, job.ID, job.Data)
-
-        // Имитация работы
-        time.Sleep(500 * time.Millisecond)
-
-        output := fmt.Sprintf("Обработано: %s (результат: %d)", job.Data, job.Handler(job.ID))
-
-        result := Result{
-            JobID:  job.ID,
-            Output: output,
-        }
-        wp.Result <- result
-    }
-}
-
-// Start запускает воркеров
-func (wp *WorkerPool) Start() {
-    for i := 1; i <= wp.NumWorkers; i++ {
-        wp.wg.Add(1)
-        go wp.worker(i)
-    }
-}
-
-// Submit отправляет задачу в пул
-func (wp *WorkerPool) Submit(job Job) {
-    wp.JobQueue <- job
-}
-
-// Wait закрывает канал задач и ждёт завершения всех воркеров
-func (wp *WorkerPool) Wait() {
-    close(wp.JobQueue)
-    wp.wg.Wait()
-    close(wp.Result)
-}
-
-func main() {
-    pool := NewWorkerPool(3, 10)
-    pool.Start()
-
-    // Отправляем задачи
-    var submitWg sync.WaitGroup
-    for i := 1; i <= 5; i++ {
-        submitWg.Add(1)
-        go func(id int) {
-            defer submitWg.Done()
-            job := Job{
-                ID:      id,
-                Data:    fmt.Sprintf("Данные-%d", id),
-                Handler: func(id int) int { return id * 2 },
-            }
-            pool.Submit(job)
-        }(i)
-    }
-    submitWg.Wait()
-
-    // Запускаем сборщик результатов в горутине
-    go func() {
-        for result := range pool.Result {
-            fmt.Printf("Результат: задача %d -> %s\n", result.JobID, result.Output)
+func worker(id int, wg *sync.WaitGroup, jobs <-chan int) {
+    defer wg.Done()
+    defer func() {
+        if r := recover(); r != nil {
+            fmt.Printf("Worker %d: panic: %v\n", id, r)
         }
     }()
 
-    // Ждём завершения всех воркеров
-    pool.Wait()
+    for job := range jobs {
+        fmt.Printf("Worker %d started the task %d\n", id, job)
+        time.Sleep(time.Second) // Simulating a task
+        fmt.Printf("Worker %d completed the task %d\n", id, job)
+    }
+}
 
-    fmt.Println("Все задачи выполнены!")
+func main() {
+    const numJobs = 10
+    const numWorkers = 3
+    jobs := make(chan int, numJobs)
+    var wg sync.WaitGroup
+
+    for w := 1; w <= numWorkers; w++ {
+        wg.Add(1)
+        go worker(w, &wg, jobs)
+    }
+
+    for j := 1; j <= numJobs; j++ {
+        jobs <- j
+    }
+    close(jobs)
+    wg.Wait()
+    fmt.Println("All tasks completed")
 }
 ```
