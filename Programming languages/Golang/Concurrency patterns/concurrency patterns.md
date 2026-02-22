@@ -364,3 +364,167 @@ func main() {
     }
 }
 ```
+
+## Fan-out / Fan-in
+
+### Проблемы которые можно решить этим паттерном:
+
+1. У вас есть 8 ядер, а ваш этап обработки данных выполняется последовательно в одной горутине. Процессор простаивает, а очередь задач растет. Мы создаем N воркеров (по числу ядер), которые разбирают задачи из общего канала параллельно, нагружая все доступные ядра.
+2. Допустим, в вашем Pipeline есть этап, который ходит во внешний API или ресайзит изображения. Это медленно. Если оставить это в одном потоке, весь конвейер будет тормозить на этом этапе.
+3. Вы запустили 100 горутин для парсинга веб-страниц. Как собрать все результаты в одном месте для финальной записи в БД, не используя глобальные переменные и мьютексы.
+4. На каждый входящий запрос создавать новую горутину — опасно. При пиковой нагрузке это может положить сервис (паника из-за переполнения памяти).
+
+**Суть**: Паттерн состоит из двух фаз, которые работают в тандеме для параллелизации задач.
+1. **Fan-out (Разветвление)**: Процесс запуска нескольких горутин (воркеров) для чтения задач из одного входного канала. Это распределяет нагрузку.
+2. **Fan-in (Сведение)**: Процесс объединения результатов работы нескольких горутин в один выходной канал. Это собирает данные воедино для финальной обработки.
+
+**Ключевая идея**: Распараллелить выполнение однотипных задач путем распределения их между фиксированным пулом воркеров и последующей агрегации результатов через мультиплексирование выходных каналов.
+
+```mermaid
+graph TD
+    subgraph "Входной поток"
+        A[Входные данные] -->|Канал задач| CIn[Channel Input]
+    end
+
+    subgraph "Fan-Out: Пул воркеров"
+        CIn --> Worker1[Worker Goroutine 1]
+        CIn --> Worker2[Worker Goroutine 2]
+        CIn --> Worker3[Worker Goroutine 3]
+
+        Worker1 --> Out1[Канал результатов 1]
+        Worker2 --> Out2[Канал результатов 2]
+        Worker3 --> Out3[Канал результатов 3]
+    end
+
+    subgraph "Fan-In: Мультиплексирование"
+        Out1 --> Mux[Мультиплексор<br/>Fan-in Goroutine]
+        Out2 --> Mux
+        Out3 --> Mux
+        Mux --> COut[Единый канал результатов]
+    end
+
+    subgraph "Выходной поток"
+        COut --> B[Агрегатор / Потребитель]
+    end
+
+    style Worker1 fill:#lightblue,stroke:#333
+    style Worker2 fill:#lightblue,stroke:#333
+    style Worker3 fill:#lightblue,stroke:#333
+    style Mux fill:#lightgreen,stroke:#333,stroke-width:2px
+    style CIn fill:#grey,stroke:#333,stroke-dasharray: 5 5
+    style COut fill:#grey,stroke:#333,stroke-dasharray: 5 5
+```
+
+### Отличие Fan-out / Fan-in от других паттернов
+
+1. **Отличие от Pipeline**
+
+* Fan-out/Fan-in: Это про горизонтальное масштабирование одного этапа. Мы берем один шаг и размножаем его исполнителей.
+
+* Pipeline: Это про вертикальную декомпозицию процесса на разные шаги (чтение -> обработка -> запись). Fan-out/Fan-in часто живет внутри одного конкретного этапа Pipeline.
+
+2. **Отличие от Worker Pool**
+
+* На самом деле, это практически одно и то же. Fan-out/Fan-in — это концептуальное описание того, как устроен worker pool.
+
+* Fan-out = диспетчеризация задач в пул. Fan-in = сбор результатов из пула. 
+Можно сказать, что Fan-out/Fan-in — это архитектурный паттерн, а Worker Pool — его конкретная реализация для выполнения задач.
+
+3. **Отличие от Pub/Sub (Publish-Subscribe)**
+
+* Fan-out/Fan-in: Каждую задачу из входного канала получает только один воркер. Это распределение работы (конкуренция за задачи).
+
+* Pub/Sub: Каждое сообщение получают все подписчики. Это широковещательная рассылка.
+
+### Пример:
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "sync"
+)
+
+// Генерация задач
+func generateJobs(n int) <-chan int {
+    ch := make(chan int)
+    go func() {
+	    for i := 1; i <= n; i++ {
+            ch <- i
+        }
+        close(ch)
+    }()
+    return ch
+}
+
+// Fan-out: Распределение задач между воркерами
+func fanOut(ctx context.Context, jobs <-chan int, numWorkers int) []<-chan int {
+    workerChannels := make([]<-chan int, 0, numWorkers)
+
+    for i := 0; i < numWorkers; i++ {
+        resultCh := make(chan int)
+		
+        go func() {
+            defer close(resultCh)
+            for {
+                select {
+                case job, ok := <-jobs:
+                    if !ok {
+                        return // Канал задач закрыт
+                    }
+                    // Обработка задачи (пример: возведение в квадрат)
+                    resultCh <- job * job
+                case <-ctx.Done():
+                    return // Отмена через контекст
+                }
+            }
+        }()
+
+        workerChannels = append(workerChannels, resultCh)
+    }
+    return workerChannels
+}
+
+// Fan-in: Объединение результатов
+func fanIn(channels []<-chan int) <-chan int {
+    var wg sync.WaitGroup
+    merged := make(chan int)
+
+    wg.Add(len(channels))
+	
+    for _, ch := range channels {
+        go func(c <-chan int) {
+            defer wg.Done()
+            for res := range c {
+                merged <- res
+            }
+        }(ch)
+    }
+
+    // Горутина для закрытия итогового канала
+    go func() {
+        wg.Wait()
+        close(merged)
+    }()
+
+    return merged
+}
+
+func main() {
+    // 1. Генерируем задачи
+    jobs := generateJobs(5)
+
+    // 2. Fan-out: распределяем задачи между 3 воркерами
+    resultChannels := fanOut(context.Background(), jobs, 3)
+
+    // 3. Fan-in: объединяем результаты из всех каналов
+    mergedResults := fanIn(resultChannels)
+
+    // 4. Результаты
+    for res := range mergedResults {
+        fmt.Printf("Получен результат: %d\n", res)
+    }
+}
+```
