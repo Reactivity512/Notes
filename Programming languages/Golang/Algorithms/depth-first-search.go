@@ -55,6 +55,6 @@ func main() {
 		8: {},
 	}
 
-	fmt.Println("DFS рекурсивный обход:")
+	fmt.Println("DFS итеративный обход:")
 	DFSIterative(graph, 1)
 }
