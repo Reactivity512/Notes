@@ -429,7 +429,7 @@ public class MyBeanRegistrar implements BeanRegistrar {
 
 Это ближе к AOT-подходу: бины регистрируются программно, а не ищутся сканированием.
 
-### 4.10. Что запомнить
+### 4.10. Ключевые моменты
 1. `@SpringBootApplication` = три аннотации, обрабатываемые в `ConfigurationClassPostProcessor` во время `refresh()`.
 2. Базовый пакет для сканирования = пакет главного класса. Всё, что вне его — не найдётся без явного `scanBasePackages`.
 3. `ClassPathBeanDefinitionScanner` читает metadata через ASM, не загружая классы.
