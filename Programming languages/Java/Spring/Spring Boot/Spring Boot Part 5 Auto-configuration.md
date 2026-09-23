@@ -417,7 +417,7 @@ com.example.autoconfigure.MyServiceAutoConfiguration
 
 **5.8.3. BeanRegistrar — новая альтернатива**
 
-В Spring Framework 6.x / Boot 3.x появился `BeanRegistrar` — программная регистрация бинов без `@Bean`-методов:
+`BeanRegistrar` появился в Spring Framework 7 / Boot 4 как альтернатива `@Bean`-методам и `BeanDefinitionRegistryPostProcessor` для программной регистрации бинов.
 
 ```java
 public class MyBeanRegistrar implements BeanRegistrar {
