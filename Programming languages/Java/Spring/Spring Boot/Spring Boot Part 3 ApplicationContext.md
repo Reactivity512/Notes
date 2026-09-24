@@ -408,7 +408,7 @@ run()
              └─ ApplicationPreparedEvent
                    │
                    ▼
-             refreshContext()   ← Часть V
+             refreshContext()   ← Часть 6
 ```
 
 ### 3.6. Spring Boot 3 vs Spring Boot 4: что изменилось
