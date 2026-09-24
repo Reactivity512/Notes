@@ -10,7 +10,7 @@
 
 Теперь `refresh()` должен превратить все эти `BeanDefinition` в **живые объекты** — бины. Разберём по шагам.
 
-### 5.1. BeanDefinition — «чертёж» бина
+### 6.1. BeanDefinition — «чертёж» бина
 
 Прежде чем говорить о жизненном цикле, надо понять, что такое `BeanDefinition`.
 ```java
@@ -51,7 +51,7 @@ public interface BeanDefinition extends AttributeAccessor, BeanMetadataElement {
 
 **Ключевая особенность**: `BeanDefinition` может быть parent для других `BeanDefinition`. При создании бина Spring делает `merge` — объединяет parent и child в RootBeanDefinition. Это называется `MergedBeanDefinition`.
 
-### 5.2. Полный жизненный цикл бина — обзор
+### 6.2. Полный жизненный цикл бина — обзор
 
 Вот полная схема. Сейчас разберём каждый шаг:
 ```
@@ -85,7 +85,7 @@ public interface BeanDefinition extends AttributeAccessor, BeanMetadataElement {
 23. @Bean(destroyMethod="...")
 ```
 
-### 5.3. BeanFactoryPostProcessor — работа с метаданными
+### 6.3. BeanFactoryPostProcessor — работа с метаданными
 
 Это первый этап. `BeanFactoryPostProcessor` (BFPP) работает с `BeanDefinition`-ами, до создания бинов.
 
@@ -121,7 +121,7 @@ public class MyBeanFactoryPostProcessor implements BeanFactoryPostProcessor {
 
 Регистрация: `@Component` или `@Bean`. Не инжектит другие бины — на этом этапе их ещё нет.
 
-### 5.4. `BeanPostProcessor` — работа с бинами
+### 6.4. `BeanPostProcessor` — работа с бинами
 
 `BeanPostProcessor` (BPP) вызывается для каждого бина при его создании.
 
@@ -168,7 +168,7 @@ BeanPostProcessor
 
 **Важно**: порядок BPP критичен. Например, `@PostConstruct` должен выполниться до AOP-проксирования, иначе `@PostConstruct`-метод вызовется на прокси, а не на целевом объекте.
 
-### 5.5. Пошаговый разбор создания бина
+### 6.5. Пошаговый разбор создания бина
 
 Разберём `doCreateBean()` из `AbstractAutowireCapableBeanFactory` — центральный метод создания бина.
 
@@ -385,7 +385,7 @@ protected void invokeInitMethods(String beanName, Object bean, RootBeanDefinitio
 
 Ключевой момент: после `afterInitialization` в singleton cache кладётся прокси, а не оригинальный объект. Все дальнейшие `@Autowired` получат прокси.
 
-## 5.6. Порядок вызовов — сводная таблица
+### 6.6. Порядок вызовов — сводная таблица
 
 Для бина `MyService` с полным набором callback'ов:
 
@@ -405,7 +405,7 @@ protected void invokeInitMethods(String beanName, Object bean, RootBeanDefinitio
 | 12 | `DisposableBean.destroy()` | `DisposableBeanAdapter`
 | 13 | `@Bean(destroyMethod)` | `DisposableBeanAdapter`
 
-### 5.7. Циклические зависимости
+### 6.7. Циклические зависимости
 
 Проблема
 ```
@@ -447,7 +447,7 @@ public class DefaultSingletonBeanRegistry {
 - Не работает для constructor injection — оба бина не могут быть созданы через конструктор, потому что конструктор вызывается до регистрации в кэше. Решение — `@Lazy` на одном из параметров.
 - Spring Boot 2.6+ запрещает circular references по умолчанию. Включается через `spring.main.allow-circular-references=true`.
 
-### 5.8. `@Lazy` — отложенная инициализация
+### 6.8. `@Lazy` — отложенная инициализация
 
 ```java
 @Service
@@ -462,7 +462,7 @@ Spring инжектит прокси `B`, реальный бин создаёт
 
 `@Lazy` на `@Configuration`-классе — вся конфигурация lazy. `@Lazy` на `@Bean` — бин lazy.
 
-### 5.9. `ObjectProvider` и `@Lookup`
+### 6.9. `ObjectProvider` и `@Lookup`
 
 `ObjectProvider`
 ```java
@@ -490,7 +490,7 @@ public abstract class MyService {
 
 Spring генерирует подкласс (CGLIB), который переопределяет метод и запрашивает бин у контейнера. Устаревший способ, `ObjectProvider` предпочтительнее.
 
-### 5.10. Уничтожение бинов
+### 6.10. Уничтожение бинов
 
 **`registerShutdownHook()`**
 Вызывается в `SpringApplication.refreshContext()`:
@@ -556,7 +556,7 @@ public void destroySingleton(String beanName) {
 
 **Важно:** Spring автоматически вызывает `close()` для бинов, реализующих `AutoCloseable` / `Closeable`, если не указано иное. Отключается через `@Bean(destroyMethod = "")`.
 
-### 5.11. `SmartLifecycle` и `Lifecycle`
+### 6.11. `SmartLifecycle` и `Lifecycle`
 
 `Lifecycle` — интерфейс для бинов с фазами start/stop:
 ```java
@@ -583,7 +583,7 @@ public interface SmartLifecycle extends Lifecycle, Phased {
 
 Пример: `WebServerStartStopLifecycle` — запускает/останавливает Tomcat.
 
-### 5.12. Spring Boot 3 vs Spring Boot 4
+### 6.12. Spring Boot 3 vs Spring Boot 4
 
 | Аспект | Spring Boot 3 | Spring Boot 4
 |--|--|--
@@ -592,11 +592,11 @@ public interface SmartLifecycle extends Lifecycle, Phased {
 | Circular references | Запрещены по умолчанию (с 2.6) | Запрещены
 | AOT | Есть, но opt-in | Более агрессивный, reflection-free по умолчанию
 | `@ConstructorBinding` | Опционально | Legacy
-| `BeanRegistrar` | Появился в Spring 6.2 | Основной способ регистрации для AOT
+| `BeanRegistrar` | Появился в Spring 7 | Основной способ регистрации для AOT
 
 Для AOT (Boot 3.x / 4.x): Spring генерирует код, который регистрирует `BeanDefinition` программно, без reflection. `@PostConstruct`, `@Autowired` и другие callback'и превращаются в прямой вызов кода. Это работает быстрее и совместимо с GraalVM native image.
 
-### 5.13. Диаграмма: полный lifecycle бина
+### 6.13. Диаграмма: полный lifecycle бина
 
 ```
 BeanDefinition
@@ -659,7 +659,7 @@ destroySingleton()
     └─ @Bean(destroyMethod) / AutoCloseable.close()
 ```
 
-### 5.14. Ключевые моменты
+### 6.14. Ключевые моменты
 
 1. `BeanDefinition` — метаданные, не бин. Из него Spring узнаёт всё о будущем объекте.
 2. `BeanFactoryPostProcessor` работает с metadata до создания бинов. Главный BFPP — `ConfigurationClassPostProcessor`.
