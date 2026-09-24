@@ -431,7 +431,7 @@ public class ServerProperties {
 | `server.address` | адрес прослушивания
 | `server.servlet.context-path` | корневой путь приложения
 | `server.servlet.session.timeout` | таймаут сессии
-| `server.tomcat.max-threads` | max потоков Tomcat
+| `server.tomcat.threads.max` | max потоков Tomcat
 | `server.tomcat.threads.min-spare` | min spare потоков
 | `server.shutdown=graceful` | graceful shutdown
 | `spring.lifecycle.timeout-per-shutdown-phase` | таймаут graceful shutdown
