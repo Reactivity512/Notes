@@ -30,7 +30,7 @@ public interface CommandLineRunner {
 `ApplicationArguments` — это уже распарсенный объект, который Spring Boot создаёт из `String[]`:
 
 ```java
-DefaultApplicationArguments args = new DefaultApplicationArguments(args);
+DefaultApplicationArguments args = new DefaultApplicationArguments(sourceArgs);
 // args.getOptionNames() → Set<String>
 // args.getOptionValues("server.port") → List<String>
 // args.getSourceArgs() → String[]
@@ -108,7 +108,7 @@ spring:
 
 ### 8.5. `WebServerGracefulShutdownLifecycle` — реализация
 
-В части 6 мы упоминали, что при создании `WebServer` регистрируются два lifecycle-бина:
+В части 7 мы упоминали, что при создании `WebServer` регистрируются два lifecycle-бина:
 ```java
 getBeanFactory().registerSingleton("webServerGracefulShutdown", 
     new WebServerGracefulShutdownLifecycle(this.webServer));
@@ -209,13 +209,18 @@ private void refreshContext(ConfigurableApplicationContext context) {
 
 Внутри `AbstractApplicationContext`:
 ```java
+@Override
 public void registerShutdownHook() {
     if (this.shutdownHook == null) {
+        // No shutdown hook registered yet.
         this.shutdownHook = new Thread(SHUTDOWN_HOOK_THREAD_NAME) {
             @Override
             public void run() {
-                synchronized (startupShutdownMonitor) {
+                startupShutdownLock.lock();
+                try {
                     doClose();
+                } finally {
+                    startupShutdownLock.unlock();
                 }
             }
         };
@@ -272,7 +277,7 @@ System.exit(exitCode);
 |--|--|--
 | Graceful shutdown | Встроен, `server.shutdown=graceful` | Встроен, включён по умолчанию для всех встроенных серверов
 | Undertow | Поддерживается | Удалён (несовместим с Servlet 6.1)
-| Jetty graceful shutdown | `StatisticsHandler` | `GracefulHandler` (изменено в 4.2)
+| Jetty graceful shutdown | `StatisticsHandler` | Spring Boot 4.2 (M1): переход на `GracefulHandler` (класс Jetty) для координации graceful shutdown 
 | `WebServerGracefulShutdownLifecycle` | `org.springframework.boot.web.server` | Модульная структура, пакеты переехали
 | `ApplicationRunner` / `CommandLineRunner` | Без изменений | Без изменений
 | `SmartLifecycle` / `LifecycleProcessor` | Без изменений | Без изменений
