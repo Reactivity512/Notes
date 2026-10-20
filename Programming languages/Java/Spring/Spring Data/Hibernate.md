@@ -216,9 +216,37 @@ spring.jpa.open-in-view=false
 7. После закрытия `Session` сущности становятся Detached. Попытка ленивой загрузки → `LazyInitializationException`.
 
 
-## Состояния сущности (Entity States) в Hibernate
+## Жизненный цикл сущностей и Persistence Context
+
+Это, пожалуй, самая важная тема в Hibernate. Если вы понимаете состояния сущностей и что происходит внутри Persistence Context — 80% багов с Hibernate перестают быть загадкой.
+
+### Что такое Persistence Context
+
+**Persistence Context** — это контейнер управляемых (managed) сущностей внутри `Session`/`EntityManager`. Его ключевые свойства:
+
+1. Это кэш первого уровня. Все загруженные сущности живут здесь до закрытия сессии.
+2. Он гарантирует identity. В рамках одной сессии `get(User.class, 1L)` дважды вернёт один и тот же Java-объект (identity map).
+3. Он отслеживает изменения. При `flush` Hibernate сравнивает текущее состояние с snapshot и генерирует `UPDATE` только для изменённых полей (dirty checking).
+4. Он реализует write-behind. `save`/`persist` не пишут сразу в БД — изменения накапливаются и синхронизируются при `flush`.
+
+```java
+User u1 = session.get(User.class, 1L);
+User u2 = session.get(User.class, 1L);
+System.out.println(u1 == u2); // true — один и тот же объект
+```
+
+Это не «оптимизация ради оптимизации». Это семантическая гарантия: в рамках одной единицы работы вы всегда работаете с одним и тем же объектом, и не получится ситуации «два объекта, оба про User с id=1, у одного name=«A», у другого name=«B»».
+
+### Четыре состояния сущности:
 
 ### 1. Transient (Преходящий / Новый / Транзиентный)
+
+Объект создан через `new`, но Hibernate о нём ничего не знает.
+
+```java
+User user = new User();  // Transient
+user.setName("Alice");
+```
 
 Это обычный Java-объект, созданный через оператор `new`. Он никак не связан с базой данных и текущей сессией Hibernate.
 
@@ -232,6 +260,12 @@ spring.jpa.open-in-view=false
 * В **Detached**: (напрямую почти не переводят, обычно объект сначала сохраняют, а потом закрывают сессию).
 
 ### 2. Persistent (Управляемый / Сохраненный / Персистентный)
+
+```java
+session.persist(user);   // user стал Persistent
+user.setName("Bob");     // изменение отслеживается
+// при flush Hibernate сгенерирует UPDATE
+```
 
 Объект находится под управлением текущей сессии (`Session`). У него есть представление в базе данных (он там сохранен или будет сохранен при `flush`).
 
@@ -252,6 +286,11 @@ spring.jpa.open-in-view=false
 
 ### 3. Detached (Отсоединенный)
 
+```java
+session.close();
+// все загруженные сущности теперь Detached
+```
+
 Объект был в состоянии Persistent (у него есть ID и он есть в БД), но потерял связь с текущей сессией (сессия была закрыта или объект был из неё извлечен).
 
 * **Связь с БД:** Объект существует в базе данных.
@@ -268,6 +307,12 @@ spring.jpa.open-in-view=false
 * В **Persistent**: вызвать `session.update()`, `session.saveOrUpdate()` или `session.merge()` (в новой открытой сессии).
 
 ### 4. Removed (Удаленный)
+
+```java
+session.remove(user);  // Removed
+// при flush → DELETE FROM users WHERE id = ?
+```
+
 Объект помечен на удаление. Он все еще связан с сессией, но "приговорен".
 
 * **Связь с БД:** Запись в БД еще существует, но помечена на удаление.
@@ -283,3 +328,262 @@ spring.jpa.open-in-view=false
 Самая частая ошибка новичков — попытка изменить Detached объект и ожидание, что он сам обновится в БД.
 
 Помните: автоматически изменения в БД уходят только из состояния Persistent. Если объект стал Detached (например, вы достали его из БД в одном методе, а обновляете в другом, где сессия уже закрыта), его нужно обязательно "переподключать" через `merge()` или `update()`.
+
+**`persist()` vs `save()`**
+
+| | `persist()` (JPA) | `save()` (Hibernate)
+|--|--|--
+| Возвращает | `void` | `Serializable` (id)
+| `INSERT` | Отложенный (при flush) | Может быть немедленным (если id нужен)
+| Вне транзакции | Ошибка | Работает (но плохо)
+| Для detached | Ошибка | Создаст новый объект (если id есть — может быть ошибка)
+
+Используйте `persist()`, если работаете через JPA API. Это стандарт.
+
+**`merge()` vs `update()`**
+
+| | `merge()` (JPA) | `update()` (Hibernate)
+|--|--|--
+| Что делает | Загружает текущее состояние из БД, копирует в новый managed-объект, возвращает его | «Присоединяет» переданный detached-объект к сессии
+| Возвращает | Управляемую копию | `void`
+| Исходный объект | Остаётся detached | Становится persistent
+| Если запись удалена | Создаст новую | Бросит исключение
+
+`merge()` не делает переданный объект managed. Он возвращает другую managed-копию.
+
+```java
+User detached = ...;               // Detached
+User managed = session.merge(detached);
+// detached — по-прежнему Detached
+// managed — Persistent
+```
+
+**`get()` vs `load()`**
+
+| | get() | load()
+|--|--|--
+| Запрос к БД | Сразу | Ленивый (прокси)
+| Если не найдено | `null` | `EntityNotFoundException` при обращении
+| Возвращает | Реальный объект или `null` | Прокси или реальный объект
+
+`load()` возвращает прокси — Hibernate подсовывает подкласс, который загрузит данные при первом обращении к полю (кроме id).
+
+**`refresh()`**
+
+Перечитывает состояние объекта из БД и перезаписывает его в памяти. Полезно, если данные могли измениться извне (другой процесс, native SQL).
+
+```java
+session.refresh(user);  // user перезагружен из БД
+```
+
+**`evict()` / `detach()`**
+
+Удаляет объект из Persistence Context. Объект становится Detached.
+
+```java
+session.evict(user);  // user больше не managed
+```
+
+**`clear()`**
+
+Полностью очищает Persistence Context. Все объекты становятся Detached.
+
+```java
+session.clear();  // кэш 1-го уровня пуст
+```
+
+**`flush()`**
+
+Синхронизирует Persistence Context с БД. Не коммитит транзакцию — только выполняет `INSERT`/`UPDATE`/`DELETE`.
+
+```java
+session.flush();  // SQL выполнен, но транзакция не закоммичена
+```
+
+Когда происходит автоматический `flush`:
+
+* Перед коммитом транзакции.
+* Перед выполнением запроса, который может затронуть затрагиваемые таблицы (auto-flush).
+* При явном `flush()`.
+* При `session.close()` (если не было коммита — откат).
+
+
+### Dirty Checking — как Hibernate узнаёт об изменениях
+
+При загрузке сущности Hibernate сохраняет snapshot — копию всех её полей. При flush он сравнивает текущее состояние с snapshot.
+
+```java
+@Transactional
+public void rename(Long id, String newName) {
+    User u = session.get(User.class, id);  // snapshot сохранён
+    u.setName(newName);                    // изменено в памяти
+    // flush при коммите: snapshot.name != u.name → UPDATE users SET name = ?
+}
+```
+
+Что это даёт:
+* Не нужно вызывать `update()` — изменения подхватываются автоматически.
+* Генерируется `UPDATE` только для изменённых полей (если не отключено).
+* Если ничего не изменилось — `UPDATE` не выполняется вообще.
+
+Dirty checking срабатывает при `flush`, а не при `set`. Если вы изменили поле и откатили транзакцию — изменение не попадёт в БД (это ок). Но если вы изменили поле и не закоммитили — оно останется в памяти объекта.
+
+### Write-behind — почему save не пишет сразу
+
+`persist()` не выполняет `INSERT` немедленно. Он регистрирует сущность в Persistence Context, а SQL генерируется при `flush`.
+
+Зачем:
+* Батчинг. Hibernate может собрать несколько `INSERT` и отправить одним пакетом (`hibernate.jdbc.batch_size`).
+* Порядок операций. Hibernate сам выстраивает порядок `INSERT`/`UPDATE`/`DELETE`, чтобы не нарушить foreign keys.
+* Экономия. Если транзакция откатится — `INSERT` вообще не выполнялся.
+
+Исключение: если стратегия генерации id — `IDENTITY` (auto-increment), Hibernate вынужден выполнить `INSERT` сразу, чтобы получить сгенерированный id. Это ломает батчинг.
+
+### Identity Map — гарантия уникальности
+
+```java
+User u1 = session.get(User.class, 1L);
+User u2 = session.get(User.class, 1L);
+assert u1 == u2;  // true
+```
+
+Как это работает: Persistence Context — это `Map<EntityKey, Object>`, где ключ — `(entityClass, id)`. При `get` Hibernate сначала смотрит в map. Если объект есть — возвращает его. Если нет — загружает из БД и кладёт в map.
+
+Зачем это нужно:
+* Гарантия консистентности: не будет двух разных объектов с одинаковым id.
+* Производительность: повторные `get` не ходят в БД.
+* Корректный dirty checking: Hibernate знает, какой именно объект отслеживать.
+
+> identity map живёт только внутри сессии. Между сессиями — это разные объекты.
+
+```java
+// Сессия 1
+User u1 = session1.get(User.class, 1L);
+session1.close();
+
+// Сессия 2
+User u2 = session2.get(User.class, 1L);
+assert u1 != u2;  // разные объекты, оба с id=1
+```
+
+### Типичные ошибки и подводные камни
+
+1. `LazyInitializationException`
+```java
+@Transactional
+public User getUser(Long id) {
+    return session.get(User.class, id);  // возвращает managed
+}
+// сессия закрыта, user — Detached
+
+// в контроллере:
+user.getOrders().size();  // LazyInitializationException!
+```
+
+Решение: загружать нужные данные внутри транзакции (`JOIN FETCH`, `@EntityGraph`), либо использовать DTO.
+
+2. `merge()` не делает объект managed
+
+```java
+User detached = ...;
+session.merge(detached);
+detached.setName("new");  // НЕ отслеживается! detached всё ещё Detached
+```
+
+Решение: работать с результатом merge():
+```java
+User managed = session.merge(detached);
+managed.setName("new");  // отслеживается
+```
+
+3. Изменение detached-объекта без `merge()`
+
+```java
+@Transactional
+public void update(User user) {  // user пришёл извне (detached)
+    user.setName("new");
+    // НИЧЕГО не произойдёт — user не managed
+}
+```
+
+Решение: `session.merge(user)` или загрузить заново и изменить.
+
+4. `save()` vs `persist()` с id
+
+Если у transient-объекта уже есть id (например, присвоен вручную), `save()` может решить, что объект detached, и выполнить `UPDATE` вместо `INSERT`. `persist()` в такой ситуации бросит исключение — это безопаснее.
+
+
+5. Долгая сессия → утечка памяти
+
+Persistence Context растёт с каждой загруженной сущностью. Если сессия открыта на весь HTTP-запрос (OpenSessionInView) и загружает тысячи объектов — память утекает.
+
+Решение: не держать сессию дольше, чем нужно; периодически `flush()` + `clear()` в пакетной обработке.
+
+6. `flush()` не коммитит
+
+```java
+session.flush();  // SQL выполнен, но не закоммичен
+// если дальше исключение — откат
+```
+
+Решение: `flush()` — для синхронизации, `commit()` — для фиксации.
+
+7. Auto-flush перед запросом
+
+Hibernate делает `flush` перед `createQuery()`, если запрос затрагивает таблицы с «грязными» сущностями. Это может привести к неожиданным `UPDATE` в середине метода.
+
+Решение: понимать это поведение; при необходимости — `FlushMode.MANUAL` / `COMMIT`.
+
+**Пример: все состояния**
+
+```java
+@Transactional
+public void demo() {
+    // 1. Transient
+    User user = new User();
+    user.setName("Alice");
+    
+    // 2. Transient → Persistent
+    session.persist(user);
+    // при flush → INSERT
+    
+    // 3. Persistent (managed)
+    user.setName("Bob");  // dirty checking подхватит при flush
+    
+    // 4. Persistent → Detached
+    session.evict(user);
+    user.setName("Charlie");  // НЕ отслеживается
+    
+    // 5. Detached → Persistent (через merge)
+    User managed = session.merge(user);
+    // managed — Persistent, user — всё ещё Detached
+    
+    // 6. Persistent → Removed
+    session.remove(managed);
+    // при flush → DELETE
+}
+```
+
+| Операция | Transient | Persistent | Detached | Removed
+|--|--|--|--|--
+| `persist()` | → Persistent | — | ❌ ошибка | → Persistent (иногда)
+| `merge()` | → Persistent (копия) | → Persistent (копия) | → Persistent (копия) | → Persistent (копия)
+| `remove()` | ❌ ошибка | → Removed | ❌ ошибка | —
+| `refresh()` | ❌ ошибка | Перечитывает | ❌ ошибка | ❌ ошибка
+| `evict()` | — | → Detached | — | → Detached
+| `get()`/`load()` | — | Возвращает | — | —
+| Dirty checking | ❌ | ✅ | ❌ | ✅ (для DELETE)
+| Lazy loading | ❌ | ✅ | ❌ (LazyInitException) | ✅
+
+**Главное**
+
+1. Persistence Context = кэш 1-го уровня + identity map + dirty checking + write-behind. Это сердце `Session`.
+2. Четыре состояния: Transient, Persistent, Detached, Removed. Переходы — через методы сессии.
+3. `persist()` ≠ `save()`, `merge()` ≠ `update()`. Понимайте разницу.
+4. `merge()` возвращает копию, исходный объект остаётся detached.
+5. Dirty checking срабатывает при flush, а не при `set`.
+6. `flush()` не коммитит — только синхронизирует.
+7. После закрытия сессии объекты Detached → ленивые поля недоступны.
+8. Identity map живёт только внутри сессии — между сессиями объекты разные.
+9. Долгая сессия = утечка памяти. Не держите её дольше необходимого.
+10. `LazyInitializationException` — симптом неправильной работы с состояниями, а не «баг Hibernate».
