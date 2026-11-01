@@ -576,3 +576,281 @@ public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
 }
 ```
 
+
+## Глава 5. Современная аутентификация (REST API и Микросервисы)
+
+### 1. JWT (JSON Web Token) — "Что это и зачем?"
+
+JWT — это стандарт (RFC 7519) для передачи claims (утверждений) между сторонами в виде JSON-объекта, подписанного криптографически.
+
+**Структура JWT**
+
+Токен состоит из трёх частей, разделённых точкой: `xxxxx.yyyyy.zzzzz`
+
+1. **Header** — алгоритм подписи (например, HS256 или RS256).
+2. **Payload** — данные (claims): `sub` (subject — кто), `exp` (expiration — когда истекает), `roles`, и т.д.
+3. **Signature** — подпись: `HMACSHA256(base64(header) + "." + base64(payload), secret)`.
+
+**Важно:**
+
+- Payload НЕ шифруется, а только кодируется в Base64. Любой может его прочитать (например, на jwt.io).
+- Подпись гарантирует, что токен не был изменён.
+- JWT — это stateless: сервер не хранит токен в сессии, а проверяет подпись при каждом запросе.
+
+**Когда использовать JWT?**
+
+- REST API для фронтенда (SPA, мобильные приложения).
+- Микросервисная архитектура (один сервис выдаёт токен, другие — проверяют).
+- SSO (Single Sign-On).
+
+### 2. Интеграция JWT в Spring Security (DIY-подход)
+
+Самый распространённый сценарий — написать свой фильтр, который будет:
+1. Читать токен из заголовка `Authorization: Bearer <token>`.
+2. Проверять подпись и срок действия.
+3. Создавать `Authentication` и класть в `SecurityContext`.
+
+**Шаг 1: Утилита для работы с JWT**
+
+Используем библиотеку JJWT (или java-jwt от Auth0):
+```java
+@Component
+public class JwtUtils {
+    @Value("${jwt.secret}")
+    private String secret;
+    
+    @Value("${jwt.expiration}")
+    private long expiration; // в миллисекундах
+    
+    public String generateToken(String username, Collection<String> roles) {
+        return Jwts.builder()
+            .setSubject(username)
+            .claim("roles", roles)
+            .setIssuedAt(new Date())
+            .setExpiration(new Date(System.currentTimeMillis() + expiration))
+            .signWith(getSigningKey(), SignatureAlgorithm.HS256)
+            .compact();
+    }
+    
+    public Claims parseToken(String token) {
+        return Jwts.parserBuilder()
+            .setSigningKey(getSigningKey())
+            .build()
+            .parseClaimsJws(token)
+            .getBody();
+    }
+    
+    public boolean isTokenValid(String token) {
+        try {
+            Claims claims = parseToken(token);
+            return !claims.getExpiration().before(new Date());
+        } catch (JwtException | IllegalArgumentException e) {
+            return false;
+        }
+    }
+    
+    private SecretKey getSigningKey() {
+        byte[] keyBytes = Decoders.BASE64.decode(secret);
+        return Keys.hmacShaKeyFor(keyBytes);
+    }
+}
+```
+
+**Шаг 2: Собственный фильтр**
+
+```java
+@Component
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+    @Autowired private JwtUtils jwtUtils;
+    @Autowired private UserDetailsService userDetailsService;
+    
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, 
+                                    HttpServletResponse response, 
+                                    FilterChain filterChain) throws ServletException, IOException {
+        
+        String authHeader = request.getHeader("Authorization");
+        
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+        
+        String token = authHeader.substring(7);
+        
+        if (!jwtUtils.isTokenValid(token)) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+        
+        String username = jwtUtils.parseToken(token).getSubject();
+        UserDetails userDetails = userDetailsService.loadUserByUsername(username);
+        
+        UsernamePasswordAuthenticationToken auth = new UsernamePasswordAuthenticationToken(
+            userDetails, null, userDetails.getAuthorities()
+        );
+        auth.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+        
+        SecurityContextHolder.getContext().setAuthentication(auth);
+        filterChain.doFilter(request, response);
+    }
+}
+```
+
+**Шаг 3: Подключение фильтра в конфигурации**
+
+```java
+http
+    .csrf(csrf -> csrf.disable())
+    .sessionManagement(session -> 
+        session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+    .authorizeHttpRequests(auth -> auth
+        .requestMatchers("/api/auth/**").permitAll()
+        .anyRequest().authenticated()
+    )
+    .addFilterBefore(jwtAuthenticationFilter, UsernamePasswordAuthenticationFilter.class);
+```
+
+### 3. Spring Security OAuth2 Resource Server (готовое решение)
+
+Если ты используешь JWT, Spring Security предлагает готовый модуль, который делает всё то же самое, но "из коробки":
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+</dependency>
+```
+
+**Вариант А: JWT с HMAC (симметричный ключ)**
+```yaml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          secret-key: "your-very-long-secret-key-at-least-256-bits..."
+```
+
+**Вариант Б: JWT с RSA (асимметричный ключ, для микросервисов)**
+```yaml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          jwk-set-uri: "https://auth-server.com/.well-known/jwks.json"
+```
+
+Сервер сам скачивает публичные ключи и проверяет подписи.
+
+**Кастомизация (извлечение ролей из токена)**
+
+По умолчанию Spring Security ищет роли в claim `scope` или `scp`. Если у тебя роли в другом месте (например, `roles` или `authorities`), нужен кастомный конвертер:
+```java
+@Bean
+public JwtAuthenticationConverter jwtAuthenticationConverter() {
+    JwtGrantedAuthoritiesConverter grantedAuthoritiesConverter = new JwtGrantedAuthoritiesConverter();
+    grantedAuthoritiesConverter.setAuthorityPrefix("ROLE_");
+    grantedAuthoritiesConverter.setAuthoritiesClaimName("roles"); // имя claim'а
+    
+    JwtAuthenticationConverter jwtAuthenticationConverter = new JwtAuthenticationConverter();
+    jwtAuthenticationConverter.setJwtGrantedAuthoritiesConverter(grantedAuthoritiesConverter);
+    return jwtAuthenticationConverter;
+}
+```
+
+**Доступ к данным JWT в коде**
+```java
+@GetMapping("/me")
+public String me(@AuthenticationPrincipal Jwt jwt) {
+    String username = jwt.getSubject();
+    String email = jwt.getClaim("email");
+    return "Hello, " + username;
+}
+```
+
+### 4. OAuth2 — "Большая картина"
+
+OAuth2 — это фреймворк для делегированной авторизации. В нём есть 4 роли:
+
+1. Resource Owner — пользователь (ты).
+2. Client — приложение, которое хочет получить доступ (твой фронтенд или микросервис).
+3. Authorization Server — сервер, который выдаёт токены (Keycloak, Auth0, Spring Authorization Server).
+4. Resource Server — сервер, который защищает ресурсы (твой бэкенд с API).
+
+Основные flow (сценарии):
+
+- Authorization Code — самый безопасный, для веб-приложений с бэкендом.
+- Authorization Code + PKCE — для SPA и мобильных приложений.
+- Client Credentials — для machine-to-machine (микросервис общается с микросервисом).
+
+**Spring Security как OAuth2 Client**
+
+Если твой бэкенд хочет "войти через Google/GitHub" или получить токен у Authorization Server:
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-client</artifactId>
+</dependency>
+```
+
+```yaml
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          google:
+            client-id: "your-client-id"
+            client-secret: "your-secret"
+            scope: openid, profile, email
+```
+
+И всё — у тебя появляется `/oauth2/authorization/google`, который запускает flow.
+
+### 5. Микросервисная архитектура
+
+В микросервисах обычно так:
+- Один сервис — **Authorization Server** (Keycloak, Spring Authorization Server).
+- Остальные сервисы — **Resource Servers**, которые проверяют JWT.
+- JWT подписывается приватным ключом Auth Server'а.
+- Resource Server'ы проверяют подпись публичным ключом (через JWKS endpoint).
+
+Это даёт:
+- **Stateless** — сервисы не ходят в Auth Server за проверкой.
+- **Масштабируемость** — можно добавлять сервисы без изменения Auth Server.
+- **Безопасность** — приватный ключ только в одном месте.
+
+### 6. Refresh Tokens — "Что делать, когда токен истёк?"
+
+JWT имеет срок жизни (обычно 15–60 минут). Чтобы не заставлять пользователя логиниться заново, используется Refresh Token:
+
+- **Access Token** — короткий (15 мин), для API.
+- **Refresh Token** — длинный (7–30 дней), хранится в БД, используется для получения нового Access Token.
+
+Эндпоинт `/api/auth/refresh`:
+```java
+@PostMapping("/refresh")
+public ResponseEntity<TokenResponse> refresh(@RequestBody RefreshRequest request) {
+    String refreshToken = request.getRefreshToken();
+    // 1. Проверить refresh token в БД
+    // 2. Если валиден — сгенерировать новый access token
+    // 3. Опционально — ротация refresh token
+    return ResponseEntity.ok(newResponse);
+}
+```
+
+### 7. Что выбрать: DIY JWT или OAuth2 Resource Server?
+
+| Критерий | DIY JWT (JJWT) | OAuth2 Resource Server
+|--|--|--
+| Простота старта | Высокая | Средняя
+| Микросервисы | Сложнее | Готовое решение
+| JWKS (публичные ключи) | Писать самому | Из коробки
+| Стандарты | Свои | RFC-совместимо
+| Гибкость | Максимальная | Ограниченная
+
+**Рекомендация:**
+- Монолит или простой проект → DIY JWT быстрее стартануть.
+- Микросервисы или планируешь Keycloak → сразу OAuth2 Resource Server.
+
