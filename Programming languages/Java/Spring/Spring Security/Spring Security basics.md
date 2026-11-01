@@ -370,3 +370,209 @@ SpEL позволяет писать очень гибкие условия. В�
 - **Method Security:** Точечные правила. Хорошо для бизнес-логики ("пользователь может редактировать только свою статью"). Работает на уровне вызовов методов, включая внутренние вызовы между сервисами.
 
 **Лучшая практика:** Используй оба. URL Security — для общей структуры, Method Security — для тонкой бизнес-логики.
+
+
+## Глава 4. Безопасность веб-приложений (Web Security)
+
+### 1. CSRF (Cross-Site Request Forgery) — "Защита от подделки запросов"
+
+**Что это за атака?**
+
+Представь: ты залогинен в своем банке в одной вкладке. В другой вкладке ты открываешь фишинговый сайт, который незаметно отправляет POST-запрос в банк ("перевести 10000 руб. на счет хакера"). Браузер автоматически подставит твои куки сессии, и банк подумает, что это ты.
+
+**Как защищает Spring Security?**
+
+По умолчанию Spring Security требует, чтобы каждый небезопасный HTTP-метод (POST, PUT, DELETE, PATCH) содержал специальный CSRF-токен.
+
+- Токен генерируется сервером и кладется в сессию.
+- При рендере формы он вставляется в скрытое поле `<input type="hidden" name="_csrf" value="...">`.
+- При отправке формы сервер проверяет: совпадает ли токен из запроса с тем, что в сессии?
+- Хакер с другого сайта не может узнать этот токен (Same-Origin Policy не даст), поэтому его запрос будет отклонен.
+
+**Как выглядит в коде (для Thymeleaf/JSP):**
+
+```java
+<form th:action="@{/transfer}" method="post">
+    <!-- Spring автоматически добавит CSRF-токен -->
+    <input type="hidden" th:name="${_csrf.parameterName}" th:value="${_csrf.token}"/>
+    <input type="number" name="amount"/>
+    <button>Перевести</button>
+</form>
+```
+
+**Когда CSRF нужно ОТКЛЮЧАТЬ?**
+
+Для REST API, который использует JWT или Basic Auth (без куки-сессий).
+Почему? Потому что JWT обычно передается в заголовке `Authorization`, а не в куках. Хакер не может подставить этот заголонок с другого сайта — атака невозможна в принципе.
+
+```java
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+        .csrf(csrf -> csrf.disable()) // <-- для REST API
+        // ...
+    ;
+    return http.build();
+}
+```
+
+Правило:
+- Используются куки-сессии + формы → CSRF ВКЛЮЧЕН (по умолчанию).
+- Stateless REST API + JWT/токены в заголовках → CSRF ОТКЛЮЧЕН.
+
+### 2. CORS (Cross-Origin Resource Sharing) — "Разрешаем запросы с других доменов"
+
+**Что это?**
+Если твой фронтенд на `http://localhost:3000` (React/Vue), а бэкенд на `http://localhost:8080` (Spring), браузер заблокирует запросы из-за политики Same-Origin. CORS — это способ сказать браузеру: "Я разрешаю запросы с этого домена".
+
+**Важный нюанс!**
+В Spring Security CORS нужно настраивать в ДВУХ местах:
+1. В Spring MVC (или через `@CrossOrigin`) — чтобы добавить правильные заголовки в ответ.
+2. В Spring Security — чтобы пропустить preflight-запрос (OPTIONS) через цепочку фильтров.
+
+Если настроить только Spring MVC — Spring Security может отклонить OPTIONS-запрос до того, как дойдет до контроллера.
+
+**Правильная настройка:**
+```java
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+        .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+        // ...
+    ;
+    return http.build();
+}
+
+@Bean
+public CorsConfigurationSource corsConfigurationSource() {
+    CorsConfiguration configuration = new CorsConfiguration();
+    configuration.setAllowedOrigins(List.of("http://localhost:3000")); // фронтенд
+    configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+    configuration.setAllowedHeaders(List.of("*"));
+    configuration.setAllowCredentials(true); // если используем куки
+    
+    UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+    source.registerCorsConfiguration("/**", configuration);
+    return source;
+}
+```
+
+**Важно:** `setAllowCredentials(true)` не работает с `allowedOrigins("*")`. Нужно указывать конкретные домены.
+
+### 3. Управление сессиями (Session Management)
+
+Стратегии создания сессий
+```java
+http.sessionManagement(session -> session
+    .sessionCreationPolicy(SessionCreationPolicy.IF_REQUIRED) // по умолчанию
+);
+```
+
+Варианты `SessionCreationPolicy`:
+- `ALWAYS` — сессия создается всегда.
+- `IF_REQUIRED` — создается только если нужна (по умолчанию).
+- `NEVER` — Spring не будет создавать сессию, но будет использовать, если она уже есть.
+- `STATELESS` — сессии не создаются и не используются. Обязательно для JWT/REST API.
+
+**Защита от Session Fixation**
+
+Атака: хакер "подсовывает" тебе свою сессию (через URL), ты в ней логинишься, и хакер получает доступ к твоему аккаунту.
+
+Spring Security по умолчанию защищает от этого: после успешного логина старая сессия уничтожается и создается новая.
+```java
+http.sessionManagement(session -> session
+    .sessionFixation(sessionFixation -> sessionFixation.migrateSession()) // по умолчанию
+);
+```
+
+Варианты:
+- `none()` — ничего не делать (опасно!).
+- `migrateSession()` — создать новую сессию, перенести атрибуты (по умолчанию).
+- `newSession()` — создать абсолютно чистую сессию.
+
+**Ограничение количества одновременных сессий**
+
+Хочешь, чтобы пользователь мог быть залогинен только в одном месте?
+```java
+http.sessionManagement(session -> session
+    .maximumSessions(1)
+    .maxSessionsPreventsLogin(false) // если true — новый логин будет отклонен
+    .expiredSessionStrategy(event -> {
+        // что делать при истечении старой сессии
+    })
+);
+```
+
+### 4. HTTP Security Headers — "Заголовки безопасности"
+
+Spring Security по умолчанию добавляет в ответы набор заголовков, которые защищают от различных атак:
+```java
+http.headers(headers -> headers
+    .frameOptions(frame -> frame.deny()) // защита от clickjacking
+    .contentTypeContentType(Customizer.withDefaults()) // защита от MIME-sniffing
+    .cacheControl(Customizer.withDefaults()) // для защищенных страниц
+    // и другие...
+);
+```
+
+Самые важные:
+- **X-Frame-Options: DENY** — запрещает встраивать страницу в `<iframe>` (защита от clickjacking).
+- **X-Content-Type-Options: nosniff** — запрещает браузеру угадывать MIME-тип.
+- **Strict-Transport-Security (HSTS)** — заставляет браузер использовать только HTTPS.
+- **X-XSS-Protection** — включает встроенный XSS-фильтр браузера.
+
+**Важно:** Для REST API часто `frameOptions` и `cacheControl` не нужны, их можно отключить.
+
+### 5. Logout — "Настройка выхода"
+
+```java
+http.logout(logout -> logout
+    .logoutUrl("/logout") // URL для выхода (POST)
+    .logoutSuccessUrl("/login?logout") // куда редиректить после
+    .invalidateHttpSession(true) // уничтожить сессию
+    .clearAuthentication(true) // очистить SecurityContext
+    .deleteCookies("JSESSIONID") // удалить куки
+    .logoutSuccessHandler((req, resp, auth) -> {
+        // кастомная логика (например, вернуть 200 OK для REST)
+        resp.setStatus(HttpServletResponse.SC_OK);
+    })
+);
+```
+
+Для REST API обычно используют кастомный `LogoutSuccessHandler`, который возвращает JSON, а не делает редирект.
+
+### 6. Итоговый пример конфигурации для REST API (JWT)
+
+Соберем всё вместе для типичного современного бэкенда:
+```java
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+        // 1. Отключаем CSRF (используем JWT, не куки)
+        .csrf(csrf -> csrf.disable())
+        
+        // 2. Настраиваем CORS
+        .cors(cors -> cors.configurationSource(corsConfigurationSource()))
+        
+        // 3. Stateless сессии (JWT)
+        .sessionManagement(session -> 
+            session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+        
+        // 4. Правила авторизации
+        .authorizeHttpRequests(auth -> auth
+            .requestMatchers("/api/auth/**").permitAll()
+            .requestMatchers("/api/admin/**").hasRole("ADMIN")
+            .anyRequest().authenticated()
+        )
+        
+        // 5. Добавляем JWT-фильтр ДО стандартного UsernamePasswordFilter
+        .addFilterBefore(jwtAuthenticationFilter, 
+            UsernamePasswordAuthenticationFilter.class)
+        
+        // 6. Отключаем ненужные заголовки для REST
+        .headers(headers -> headers.frameOptions(frame -> frame.disable()));
+    
+    return http.build();
+}
+```
+
