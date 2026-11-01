@@ -854,3 +854,246 @@ public ResponseEntity<TokenResponse> refresh(@RequestBody RefreshRequest request
 - Монолит или простой проект → DIY JWT быстрее стартануть.
 - Микросервисы или планируешь Keycloak → сразу OAuth2 Resource Server.
 
+
+## Глава 6. Тестирование и отладка
+
+### 1. Тестирование контроллеров с MockMvc
+
+Самый частый сценарий — проверить, что эндпоинт возвращает 200 для админа и 403 для обычного пользователя.
+
+Базовый вариант: `@WithMockUser`
+```java
+@SpringBootTest
+@AutoConfigureMockMvc
+class ArticleControllerTest {
+    
+    @Autowired
+    private MockMvc mockMvc;
+    
+    @Test
+    @WithMockUser(username = "user", roles = {"USER"})
+    void shouldReturnArticlesForAuthenticatedUser() throws Exception {
+        mockMvc.perform(get("/api/articles"))
+            .andExpect(status().isOk());
+    }
+    
+    @Test
+    void shouldReturn401ForUnauthenticated() throws Exception {
+        mockMvc.perform(get("/api/articles"))
+            .andExpect(status().isUnauthorized());
+    }
+    
+    @Test
+    @WithMockUser(username = "user", roles = {"USER"})
+    void shouldReturn403ForNonAdmin() throws Exception {
+        mockMvc.perform(delete("/api/articles/1"))
+            .andExpect(status().isForbidden());
+    }
+    
+    @Test
+    @WithMockUser(username = "admin", roles = {"ADMIN"})
+    void shouldAllowAdminToDelete() throws Exception {
+        mockMvc.perform(delete("/api/articles/1"))
+            .andExpect(status().isOk());
+    }
+}
+```
+
+**Важно:** `@WithMockUser` создаёт пользователя только для теста, он не сохраняется в БД.
+
+### 2. Тестирование с реальным пользователем из БД: `@WithUserDetails`
+
+Если тебе нужен реальный пользователь из базы (например, для проверки прав, которые зависят от данных в БД):
+
+```java
+@Test
+@WithUserDetails("admin@example.com") // username из БД
+void shouldWorkWithRealUser() throws Exception {
+    mockMvc.perform(get("/api/profile"))
+        .andExpect(status().isOk());
+}
+```
+
+**Требование:** В контексте Spring должен быть бин `UserDetailsService`.
+
+### 3. Тестирование Method Security
+
+Для проверки `@PreAuthorize` и других аннотаций на методах:
+```java
+@SpringBootTest
+class ArticleServiceTest {
+    
+    @Autowired
+    private ArticleService articleService;
+    
+    @Test
+    @WithMockUser(username = "user", roles = {"USER"})
+    void userShouldNotDeleteAnyArticle() {
+        Article article = new Article();
+        article.setAuthor(new User("another-user"));
+        
+        assertThrows(AccessDeniedException.class, () -> {
+            articleService.deleteArticle(article);
+        });
+    }
+    
+    @Test
+    @WithMockUser(username = "admin", roles = {"ADMIN"})
+    void adminShouldDeleteAnyArticle() {
+        Article article = new Article();
+        article.setAuthor(new User("another-user"));
+        
+        assertDoesNotThrow(() -> {
+            articleService.deleteArticle(article);
+        });
+    }
+}
+```
+
+### 4. Тестирование с JWT (для REST API)
+
+Если используешь JWT, нужно подделать токен в тесте:
+```java
+@Test
+void shouldReturnProfileWithValidJwt() throws Exception {
+    String token = jwtUtils.generateToken("user", List.of("ROLE_USER"));
+    
+    mockMvc.perform(get("/api/profile")
+            .header("Authorization", "Bearer " + token))
+        .andExpect(status().isOk());
+}
+
+@Test
+void shouldReturn401WithInvalidJwt() throws Exception {
+    mockMvc.perform(get("/api/profile")
+            .header("Authorization", "Bearer invalid-token"))
+        .andExpect(status().isUnauthorized());
+}
+```
+
+### 5. Отладка: Включаем логи Spring Security
+
+Когда что-то не работает, первое, что нужно сделать — включить логи.
+
+В `application.yml`:
+```yaml
+logging:
+  level:
+    org.springframework.security: DEBUG
+    org.springframework.web.filter: DEBUG
+```
+
+Что смотреть в логах:
+- Какие фильтры сработали — увидишь цепочку фильтров.
+- Почему доступ запрещён — Spring Security напишет, какое правило сработало.
+- Ошибки аутентификации — `BadCredentialsException`, `DisabledException` и т.д.
+
+Пример полезного лога:
+```
+AuthorizationFilter: Failed to authorize since no AuthorizationManager 
+returned true for request [GET /api/admin/users]
+```
+
+Это значит: пользователь аутентифицирован, но у него нет прав.
+
+### 6. Частые ошибки и их решения
+
+**Ошибка 1**: "Access Denied" для админа
+
+**Симптом**: Пользователь с ролью `ROLE_ADMIN` получает 403.
+
+**Причина**: В `UserDetailsService` возвращаешь authorities без префикса `ROLE_`.
+
+**Решение**:
+```java
+// Неправильно:
+return new User(username, password, List.of(() -> "ADMIN"));
+
+// Правильно:
+return new User(username, password, List.of(() -> "ROLE_ADMIN"));
+```
+---
+
+**Ошибка 2**: CSRF 403 на POST-запрос
+
+**Симптом**: POST-запросы возвращают 403, хотя пользователь аутентифицирован.
+
+**Причина**: CSRF включён, а токена нет.
+
+**Решение**:
+- Для REST API с JWT — отключи CSRF: .csrf(csrf -> csrf.disable()).
+- Для форм — добавь CSRF-токен в запрос.
+
+---
+
+**Ошибка 3**: CORS preflight (OPTIONS) возвращает 403
+
+**Симптом**: Браузер блокирует запрос, в консоли ошибка CORS.
+
+**Причина**: Spring Security отклоняет OPTIONS-запрос до того, как дойдёт до контроллера.
+
+**Решение**: Настрой CORS в Spring Security (см. Главу 4):
+```java
+http.cors(cors -> cors.configurationSource(corsConfigurationSource()));
+```
+
+---
+
+**Ошибка 4**: "Full authentication is required"
+
+**Симптом**: Запрос возвращает 401, хотя токен валидный.
+
+**Причина**: JWT-фильтр не сработал или не положил Authentication в SecurityContext.
+
+**Решение**:
+1. Проверь, что фильтр добавлен в цепочку: `.addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)`.
+2. Проверь логи — есть ли ошибка парсинга токена.
+
+---
+
+**Ошибка 5**: `@PreAuthorize` не работает
+
+**Симптом**: Метод вызывается, хотя не должно быть прав.
+
+**Причина**: Не включён Method Security.
+
+**Решение**: Добавь `@EnableMethodSecurity` на конфигурацию:
+```java
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig { ... }
+```
+
+---
+
+### 7. Полезные утилиты для тестирования
+
+`SecurityMockMvcRequestPostProcessors` — для тонкой настройки
+
+```java
+@Test
+void shouldWorkWithCustomAuthentication() throws Exception {
+    mockMvc.perform(get("/api/profile")
+            .with(user("admin").roles("ADMIN"))) // аналог @WithMockUser, но inline
+        .andExpect(status().isOk());
+}
+
+@Test
+void shouldWorkWithCsrf() throws Exception {
+    mockMvc.perform(post("/api/articles")
+            .with(csrf())) // добавляет CSRF-токен
+        .andExpect(status().isOk());
+}
+```
+
+### 8. Чек-лист для отладки
+
+Если что-то не работает, проверь по порядку:
+
+1. **Логи включены?** — `logging.level.org.springframework.security=DEBUG`.
+2. **Фильтр добавлен в цепочку?** — `.addFilterBefore(...)` в конфигурации.
+3. **Правила авторизации в правильном порядке?** — специфичные (`/admin/**`) раньше общих (`/api/**`).
+4. **CSRF отключён для REST?** — `.csrf(csrf -> csrf.disable()`).
+5. **CORS настроен в Spring Security?** — `.cors(cors -> ...)`.
+6. **Method Security включён?** — `@EnableMethodSecurity`.
+7. **Роли с префиксом `ROLE_`?** — если используешь `hasRole()`.
