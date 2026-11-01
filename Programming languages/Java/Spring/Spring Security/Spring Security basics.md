@@ -66,3 +66,130 @@ Spring Security не перехватывает запросы с помощью
 7. Запрос идет дальше по фильтрам, доходит до `AuthorizationFilter`, который проверяет права.
 8. Запрос попадает в Controller. Ты можешь достать пользователя из `SecurityContext`.
 
+
+## Глава 2. Аутентификация (Классическая)
+
+### 1. `UserDetails` и `UserDetailsService` — "Где взять пользователя?"
+
+Spring Security не знает, где хранятся твои пользователи (в БД, в LDAP, в памяти, в файле). Ему нужен контракт — способ получить данные о пользователе.
+
+**А. `UserDetails` (Интерфейс)**
+Это объект, описывающий пользователя с точки зрения Spring Security. Он должен реализовать несколько методов:
+- `getUsername()` — логин.
+- `getPassword()` — хешированный пароль (да, хранится именно хеш!).
+- `getAuthorities()` — список прав (`GrantedAuthority`).
+- `isAccountNonExpired()`, `isAccountNonLocked()`, `isCredentialsNonExpired()`, `isEnabled()` — флаги состояния аккаунта (заблокирован, истек ли пароль и т.д.).
+
+**Лайфхак:** В своих проектах ты обычно не пишешь класс с нуля, а наследуешься от готового `org.springframework.security.core.userdetails.User` или делаешь свою сущность (например, JPA-Entity), реализующую этот интерфейс.
+
+**Б. `UserDetailsService` (Интерфейс)**
+
+Это "поставщик" пользователей. У него всего один метод:
+```java
+UserDetails loadUserByUsername(String username) throws UsernameNotFoundException;
+```
+
+Ты пишешь свою реализацию, например:
+```java
+@Service
+public class MyUserDetailsService implements UserDetailsService {
+    @Autowired
+    private UserRepository userRepository;
+
+    @Override
+    public UserDetails loadUserByUsername(String username) {
+        User user = userRepository.findByUsername(username)
+            .orElseThrow(() -> new UsernameNotFoundException("User not found"));
+        // user должен реализовывать UserDetails
+        return user;
+    }
+}
+```
+
+**Главное правило:** Если пользователь не найден — всегда бросай `UsernameNotFoundException`. Никогда не возвращай `null`.
+
+### 2. PasswordEncoder — "Как хранить пароли?"
+
+Никогда не храни пароли в открытом виде. Это правило №1.
+
+Spring Security предоставляет интерфейс PasswordEncoder с двумя методами:
+- `String encode(CharSequence rawPassword)` — превращает сырой пароль в хеш.
+- `boolean matches(CharSequence rawPassword, String encodedPassword)` — сравнивает сырой пароль с хешем.
+
+**Самый популярный вариант: `BCryptPasswordEncoder`**
+```java
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}
+```
+
+- BCrypt автоматически добавляет "соль" (salt) к каждому паролю.
+- Результат выглядит так: `$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy`
+- Одна и та же строка при каждом хешировании даст разный результат (из-за соли), но `matches()` все равно сработает корректно.
+
+### 3. `AuthenticationManager` и `AuthenticationProvider` — "Кто проверяет?"
+
+Когда `UsernamePasswordAuthenticationFilter` получает логин и пароль, он не проверяет их сам. Он делегирует это дальше по цепочке.
+
+**А. `AuthenticationManager` (Интерфейс)**
+
+Это "менеджер" аутентификации. У него один метод:
+```java
+Authentication authenticate(Authentication authentication) throws AuthenticationException;
+```
+
+На практике почти всегда используется реализация `ProviderManager`. Её задача — передать запрос нужному провайдеру.
+
+**Б. `AuthenticationProvider` (Интерфейс)**
+
+Это конкретный "исполнитель". Он знает, как аутентифицировать пользователя определенным способом.
+```java
+public interface AuthenticationProvider {
+    Authentication authenticate(Authentication authentication) throws AuthenticationException;
+    boolean supports(Class<?> authentication); // Поддерживаю ли я этот тип?
+}
+```
+
+**Как они работают вместе (стандартный сценарий):**
+1. Фильтр создает `UsernamePasswordAuthenticationToken` (это подтип `Authentication` с логином и паролем).
+2. Передает его в `AuthenticationManager`.
+3. `ProviderManager` перебирает список `AuthenticationProvider`-ов и спрашивает каждого: `supports()`?
+4. Находит `DaoAuthenticationProvider` (стандартный, для работы с БД).
+5. `DaoAuthenticationProvider` делает две вещи:
+    - Вызывает твой `UserDetailsService.loadUserByUsername()` — получает `UserDetails`.
+    - С помощью `PasswordEncoder.matches()` сравнивает введенный пароль с тем, что в `UserDetails`.
+6. Если всё ок — создает новый `Authentication` объект, уже с флагом `isAuthenticated = true`, и возвращает его.
+7. Если ошибка — бросает исключение (`BadCredentialsException`, `DisabledException` и т.д.).
+
+**Кастомный `AuthenticationProvider`**
+
+Если тебе нужна нестандартная логика (например, аутентификация по SMS-коду, или через внешний API), ты пишешь свой провайдер:
+```java
+@Component
+public class SmsAuthenticationProvider implements AuthenticationProvider {
+    @Override
+    public Authentication authenticate(Authentication auth) {
+        String phone = auth.getName();
+        String code = auth.getCredentials().toString();
+        // своя логика проверки кода...
+        return authenticatedToken;
+    }
+    @Override
+    public boolean supports(Class<?> authentication) {
+        return SmsAuthenticationToken.class.isAssignableFrom(authentication);
+    }
+}
+```
+
+### 4. Краткая схема всего процесса (Login с формой)
+
+1. Пользователь отправляет POST на `/login` с `username` и `password`.
+2. `UsernamePasswordAuthenticationFilter` перехватывает запрос.
+3. Создает неаутентифицированный `UsernamePasswordAuthenticationToken`.
+4. Передает в `AuthenticationManager`.
+5. `DaoAuthenticationProvider` вызывает твой `UserDetailsService` → получает Us`erDetails.
+6. Сравнивает пароли через `PasswordEncoder.matches()`.
+7. Если ок → создает аутентифицированный `Authentication` → кладет в `SecurityContext`.
+8. Возвращает успешный ответ (редирект или JSON).
+9. Если не ок → бросает исключение, которое обрабатывает `AuthenticationFailureHandler` (обычно редирект на `/login?error`).
