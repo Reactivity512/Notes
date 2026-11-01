@@ -193,3 +193,180 @@ public class SmsAuthenticationProvider implements AuthenticationProvider {
 7. Если ок → создает аутентифицированный `Authentication` → кладет в `SecurityContext`.
 8. Возвращает успешный ответ (редирект или JSON).
 9. Если не ок → бросает исключение, которое обрабатывает `AuthenticationFailureHandler` (обычно редирект на `/login?error`).
+
+## Глава 3. Авторизация и контроль доступа
+
+### 1. Роли vs Привилегии (Authorities)
+
+В Spring Security все права — это строки, которые реализуют интерфейс `GrantedAuthority`. Но исторически сложилось два подхода к их именованию:
+
+- Роли (Roles): Широкие категории. Обычно начинаются с префикса `ROLE_`.
+    * Примеры: `ROLE_ADMIN`, `ROLE_USER`, `ROLE_MODERATOR`.
+    * Используются, когда права групповые: "админ может всё", "пользователь — только читать".
+- Привилегии (Authorities/Privileges): Более мелкие, точные права.
+    * Примеры: `READ_PRIVILEGE`, `WRITE_PRIVILEGE`, `DELETE_ARTICLE`.
+    * Используются в сложных системах, где нужны гибкие настройки.
+
+**Важный момент:** Spring Security не делает между ними технической разницы. И то, и другое — просто строки в списке `authorities`. Префикс `ROLE_` — это просто соглашение, но методы `hasRole()` и `hasAuthority()` работают по-разному (об этом ниже).
+
+### 2. Защита URL (HTTP Security)
+
+Это самый распространенный способ. Ты говоришь Spring Security: "Этот URL доступен только админам, а этот — всем".
+
+Настраивается в классе конфигурации через `SecurityFilterChain`:
+```java
+@Bean
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+        .authorizeHttpRequests(auth -> auth
+            // Публичные эндпоинты
+            .requestMatchers("/login", "/register", "/public/**").permitAll()
+            
+            // Админ-зона: только для пользователей с ролью ADMIN
+            .requestMatchers("/admin/**").hasRole("ADMIN")
+            
+            // Эндпоинт для модераторов ИЛИ админов
+            .requestMatchers("/moderator/**").hasAnyRole("MODERATOR", "ADMIN")
+            
+            // Эндпоинт для конкретной привилегии
+            .requestMatchers("/api/articles/delete").hasAuthority("DELETE_ARTICLE")
+            
+            // Любой аутентифицированный пользователь
+            .requestMatchers("/api/**").authenticated()
+            
+            // Всё остальное — запретить
+            .anyRequest().denyAll()
+        )
+        // ... другие настройки (csrf, cors, formLogin и т.д.)
+        ;
+    return http.build();
+}
+```
+
+Ключевые методы:
+- `.permitAll()` — доступно всем (анонимусам тоже).
+- `.authenticated()` — только аутентифицированным.
+- `.hasRole("ADMIN")` — нужна роль `ROLE_ADMIN` (префикс добавляется автоматически!).
+- `.hasAuthority("DELETE_ARTICLE")` — нужна привилегия `DELETE_ARTICLE` (без префикса).
+- `.hasAnyRole(...)` — любая из перечисленных ролей.
+- `.access(...)` — для сложных условий через SpEL (см. ниже).
+
+**Внимание:** Правила проверяются сверху вниз. Первое совпадение — победа. Поэтому более специфичные правила (`/admin/**`) должны идти раньше общих (`/api/**`).
+
+### 3. Защита методов (Method Security)
+
+Иногда нужно защитить не URL, а конкретный метод в Service. Например, метод `deleteUser()` должен быть доступен только админу, независимо от того, с какого URL его вызвали.
+
+**Шаг 1: Включить метод-секьюрити**
+
+В Spring Security 6+ это делается одной аннотацией на конфигурации:
+```java
+@Configuration
+@EnableMethodSecurity // <-- волшебная строчка
+public class SecurityConfig { ... }
+```
+
+**Шаг 2: Использовать аннотации на методах**
+
+А. `@PreAuthorize` — самая мощная
+Проверяет условие до вызова метода. Поддерживает SpEL (Spring Expression Language):
+```java
+@Service
+public class ArticleService {
+    
+    // Простая проверка роли
+    @PreAuthorize("hasRole('ADMIN')")
+    public void deleteAnyArticle(Long id) { ... }
+    
+    // Проверка привилегии
+    @PreAuthorize("hasAuthority('WRITE_ARTICLE')")
+    public Article createArticle(Article article) { ... }
+    
+    // Сложная логика: пользователь может редактировать ТОЛЬКО свои статьи
+    @PreAuthorize("#article.author.id == authentication.principal.id")
+    public void editArticle(Article article) { ... }
+    
+    // Комбинированные условия
+    @PreAuthorize("hasRole('ADMIN') or #article.author.id == authentication.principal.id")
+    public void deleteArticle(Article article) { ... }
+}
+```
+
+Б. `@PostAuthorize` — проверка ПОСЛЕ выполнения
+
+Полезна, когда нужно проверить что-то, что известно только после выполнения метода (например, вернуть данные, если пользователь имеет право их видеть):
+```java
+@PostAuthorize("returnObject.author.id == authentication.principal.id")
+public Article getArticle(Long id) { ... }
+```
+
+В. `@Secured` — старая, простая аннотация
+
+Не поддерживает SpEL, только роли:
+```java
+@Secured("ROLE_ADMIN")
+public void adminOnly() { ... }
+```
+
+Г. `@RolesAllowed` — из стандарта JSR-250
+
+Аналог `@Secured`, но без префикса `ROLE_`:
+```java
+@RolesAllowed("ADMIN") // эквивалентно ROLE_ADMIN
+public void adminOnly() { ... }
+```
+
+### 4. Доступ к текущему пользователю в Controller
+
+Часто нужно получить данные текущего пользователя прямо в контроллере. Есть 3 способа:
+
+**Способ 1: Через `@AuthenticationPrincipal` (рекомендуемый)**
+
+Если твой `UserDetails` — это сущность `User` из БД:
+```java
+@GetMapping("/profile")
+public String profile(@AuthenticationPrincipal User user) {
+    return "Привет, " + user.getUsername();
+}
+```
+
+**Способ 2: Через `Authentication` напрямую**
+```java
+@GetMapping("/info")
+public String info(Authentication authentication) {
+    String username = authentication.getName();
+    Collection<? extends GrantedAuthority> roles = authentication.getAuthorities();
+    return "User: " + username + ", Roles: " + roles;
+}
+```
+
+**Способ 3: Через `SecurityContextHolder` (в любом месте кода)**
+```java
+public void someBusinessLogic() {
+    Authentication auth = SecurityContextHolder.getContext().getAuthentication();
+    String username = auth.getName();
+}
+```
+
+### 5. SpEL в @PreAuthorize — шпаргалка
+
+SpEL позволяет писать очень гибкие условия. Вот частые конструкции:
+
+| Выражение | Что означает
+|--|--
+| `hasRole('ADMIN')` | Есть роль `ROLE_ADMIN`
+| `hasAuthority('READ')` | Есть привилегия `READ`
+| `hasAnyRole('A', 'B')` | Есть роль A ИЛИ B
+| `authentication.name` | Имя текущего пользователя
+| `authentication.principal` | Объект `UserDetails` текущего пользователя
+| `#id` | Ссылка на параметр метода с именем `id`
+| `#user.id == authentication.principal.id` | Сравнение (например, "это мой объект")
+| `permitAll` | Всегда разрешено
+| `denyAll` | Всегда запрещено
+
+### 6. Что выбрать: URL или Method Security?
+
+- **URL Security (HttpSecurity):** Глобальные правила. Хорошо для разграничения "публичное / для юзеров / для админов". Работает на уровне HTTP-запросов.
+- **Method Security:** Точечные правила. Хорошо для бизнес-логики ("пользователь может редактировать только свою статью"). Работает на уровне вызовов методов, включая внутренние вызовы между сервисами.
+
+**Лучшая практика:** Используй оба. URL Security — для общей структуры, Method Security — для тонкой бизнес-логики.
